@@ -2,13 +2,20 @@ import json
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
-APP_TITLE = "英検AIコーチ Ver.1"
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+except Exception:
+    gspread = None
+    Credentials = None
+
+APP_TITLE = "英検AIコーチ Ver.2"
 DATA_DIR = Path("data")
 LOG_FILE = DATA_DIR / "study_log.csv"
 SETTINGS_FILE = DATA_DIR / "settings.json"
@@ -248,6 +255,11 @@ DEFAULT_SETTINGS = {
     "coach_image_url": "",
 }
 
+SHEET_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
 
 @dataclass
 class Phase:
@@ -266,9 +278,129 @@ def ensure_data_files() -> None:
         pd.DataFrame(columns=LOG_COLUMNS).to_csv(LOG_FILE, index=False)
 
 
+def _get_sheet_mode() -> str:
+    try:
+        if "gcp_service_account" in st.secrets and "spreadsheet" in st.secrets:
+            return "sheets"
+    except Exception:
+        pass
+    return "local"
+
+
+def _get_gspread_client() -> Optional["gspread.Client"]:
+    if gspread is None or Credentials is None:
+        return None
+    try:
+        creds = Credentials.from_service_account_info(
+            st.secrets["gcp_service_account"], scopes=SHEET_SCOPES
+        )
+        return gspread.authorize(creds)
+    except Exception:
+        return None
+
+
+def _get_spreadsheet():
+    client = _get_gspread_client()
+    if client is None:
+        return None
+    try:
+        spreadsheet_name = st.secrets["spreadsheet"]["name"]
+        return client.open(spreadsheet_name)
+    except Exception:
+        return None
+
+
+def _get_or_create_worksheet(sheet, title: str, headers: List[str]):
+    try:
+        ws = sheet.worksheet(title)
+    except Exception:
+        ws = sheet.add_worksheet(title=title, rows=1000, cols=max(len(headers), 10))
+        ws.append_row(headers)
+    values = ws.get_all_values()
+    if not values:
+        ws.append_row(headers)
+    elif values[0] != headers:
+        ws.clear()
+        ws.append_row(headers)
+    return ws
+
+
+def _load_settings_from_sheets() -> Dict:
+    sheet = _get_spreadsheet()
+    if sheet is None:
+        raise RuntimeError("Google Sheets に接続できません。")
+    ws = _get_or_create_worksheet(sheet, "settings", ["key", "value"])
+    records = ws.get_all_records()
+    if not records:
+        for k, v in DEFAULT_SETTINGS.items():
+            ws.append_row([k, json.dumps(v, ensure_ascii=False)])
+        return DEFAULT_SETTINGS.copy()
+    settings = DEFAULT_SETTINGS.copy()
+    for row in records:
+        key = row.get("key")
+        raw = row.get("value")
+        if not key:
+            continue
+        try:
+            settings[key] = json.loads(raw)
+        except Exception:
+            settings[key] = raw
+    return settings
+
+
+def _save_settings_to_sheets(settings: Dict) -> None:
+    sheet = _get_spreadsheet()
+    if sheet is None:
+        raise RuntimeError("Google Sheets に接続できません。")
+    ws = _get_or_create_worksheet(sheet, "settings", ["key", "value"])
+    ws.clear()
+    ws.append_row(["key", "value"])
+    for k, v in settings.items():
+        ws.append_row([k, json.dumps(v, ensure_ascii=False)])
+
+
+def _load_log_from_sheets() -> pd.DataFrame:
+    sheet = _get_spreadsheet()
+    if sheet is None:
+        raise RuntimeError("Google Sheets に接続できません。")
+    ws = _get_or_create_worksheet(sheet, "study_log", LOG_COLUMNS)
+    records = ws.get_all_records()
+    if not records:
+        return pd.DataFrame(columns=LOG_COLUMNS)
+    df = pd.DataFrame(records)
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    return df
+
+
+def _save_log_row_to_sheets(row: Dict) -> None:
+    sheet = _get_spreadsheet()
+    if sheet is None:
+        raise RuntimeError("Google Sheets に接続できません。")
+    ws = _get_or_create_worksheet(sheet, "study_log", LOG_COLUMNS)
+    records = ws.get_all_records()
+    df = pd.DataFrame(records) if records else pd.DataFrame(columns=LOG_COLUMNS)
+    row_df = pd.DataFrame([row])
+    row_df["date"] = pd.to_datetime(row_df["date"])
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df[df["date"] != row_df.loc[0, "date"]]
+    df = pd.concat([df, row_df], ignore_index=True).sort_values("date")
+    export = df.copy()
+    export["date"] = export["date"].dt.strftime("%Y-%m-%d")
+    ws.clear()
+    ws.append_row(LOG_COLUMNS)
+    for _, rec in export.iterrows():
+        ws.append_row([rec.get(col, "") for col in LOG_COLUMNS])
+
+
 def load_settings() -> Dict:
     ensure_data_files()
-    settings = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    mode = _get_sheet_mode()
+    if mode == "sheets":
+        settings = _load_settings_from_sheets()
+    else:
+        settings = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
     settings.setdefault("learning_stage", "英検2級")
     settings.setdefault(
         "selected_resources",
@@ -282,14 +414,19 @@ def load_settings() -> Dict:
 
 
 def save_settings(settings: Dict) -> None:
-    SETTINGS_FILE.write_text(
-        json.dumps(settings, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    if _get_sheet_mode() == "sheets":
+        _save_settings_to_sheets(settings)
+    else:
+        SETTINGS_FILE.write_text(
+            json.dumps(settings, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
 
 def load_log() -> pd.DataFrame:
     ensure_data_files()
+    if _get_sheet_mode() == "sheets":
+        return _load_log_from_sheets()
     df = pd.read_csv(LOG_FILE)
     if not df.empty:
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
@@ -297,6 +434,9 @@ def load_log() -> pd.DataFrame:
 
 
 def save_log_row(row: Dict) -> None:
+    if _get_sheet_mode() == "sheets":
+        _save_log_row_to_sheets(row)
+        return
     df = load_log()
     row_df = pd.DataFrame([row])
     row_df["date"] = pd.to_datetime(row_df["date"])
@@ -358,8 +498,18 @@ def build_daily_plan(settings: Dict, today: date) -> Dict:
     ).date()
     phase = get_phase(today, target_exam_date, stage)
     is_weekend = today.weekday() >= 5
-    total_minutes = settings["weekend_minutes"] if is_weekend else settings["weekday_minutes"]
-    today_name = ["月曜日", "火曜日", "水曜日", "木曜日", "金曜日", "土曜日", "日曜日"][today.weekday()]
+    total_minutes = (
+        settings["weekend_minutes"] if is_weekend else settings["weekday_minutes"]
+    )
+    today_name = [
+        "月曜日",
+        "火曜日",
+        "水曜日",
+        "木曜日",
+        "金曜日",
+        "土曜日",
+        "日曜日",
+    ][today.weekday()]
 
     if today_name == settings["busy_day"]:
         total_minutes = max(35, total_minutes - 20)
@@ -368,7 +518,9 @@ def build_daily_plan(settings: Dict, today: date) -> Dict:
 
     weights = calculate_stage_weights(stage, phase.name)
     minutes = {k: max(5, round(total_minutes * v)) for k, v in weights.items()}
-    vocab_words = max(25, round(minutes["vocab"] * (2.1 if stage == "英検2級" else 2.3)))
+    vocab_words = max(
+        25, round(minutes["vocab"] * (2.1 if stage == "英検2級" else 2.3))
+    )
     if is_weekend:
         vocab_words += 10
 
@@ -379,7 +531,11 @@ def build_daily_plan(settings: Dict, today: date) -> Dict:
     else:
         writing_sets = 1 if phase.name == "準1級土台期" else 2
         reading_sets = 1 if not is_weekend else 2
-        mission = "語彙・要約・社会テーマ長文を伸ばす日" if phase.name == "準1級土台期" else "本番形式で仕上げる日"
+        mission = (
+            "語彙・要約・社会テーマ長文を伸ばす日"
+            if phase.name == "準1級土台期"
+            else "本番形式で仕上げる日"
+        )
 
     return {
         "stage": stage,
@@ -501,7 +657,9 @@ def praise_message(df: pd.DataFrame) -> str:
 
     if latest.get("actual_vocab", 0) > latest.get("planned_vocab", 0):
         messages.append("計画より多く単語を進められたね。かなりえらい！")
-    if latest.get("total_minutes", 0) >= latest.get("planned_listening", 0) + latest.get("grammar_minutes", 0) + 20:
+    if latest.get("total_minutes", 0) >= latest.get(
+        "planned_listening", 0
+    ) + latest.get("grammar_minutes", 0) + 20:
         messages.append("予定を上回る学習時間！集中力がすごい！")
     if latest.get("understanding", 0) >= 4:
         messages.append("理解度も高い日です。この感覚を明日もつなげよう。")
@@ -512,7 +670,9 @@ def praise_message(df: pd.DataFrame) -> str:
     if not messages:
         messages.append("今日も記録できたのが大きな前進です。継続できていて良い流れです。")
 
-    return "\n\n".join(messages)
+    return "
+
+".join(messages)
 
 
 def coach_comment(settings: Dict, plan: Dict, df: pd.DataFrame) -> str:
@@ -544,9 +704,23 @@ def coach_comment(settings: Dict, plan: Dict, df: pd.DataFrame) -> str:
         if stage == "英検2級"
         else "準1級では語彙・要約・長文への耐性を伸ばすのが大事。"
     )
-    streak_line = f"いま {streak}日連続です。" if streak > 0 else "まずは今日の1日目を作りましょう。"
+    streak_line = (
+        f"いま {streak}日連続です。"
+        if streak > 0
+        else "まずは今日の1日目を作りましょう。"
+    )
 
-    return f"{opener} {style}\n\n{mission}\n\n{stage_line}\n\n{streak_line}\n\n{praise}"
+    return (
+        f"{opener} {style}
+
+{mission}
+
+{stage_line}
+
+{streak_line}
+
+{praise}"
+    )
 
 
 def coach_bubble_html(settings: Dict, message: str) -> str:
@@ -566,7 +740,8 @@ def coach_bubble_html(settings: Dict, message: str) -> str:
         "フレンドリー": "#34D399",
         "お姉さん/お兄さん風": "#F59E0B",
     }.get(personality, "#C084FC")
-    escaped = message.replace("\n", "<br>")
+    escaped = message.replace("
+", "<br>")
 
     return f"""
     <div style='display:flex; align-items:flex-start; gap:12px; margin:8px 0 18px 0;'>
@@ -603,11 +778,17 @@ def generate_feedback(df: pd.DataFrame, settings: Dict) -> str:
         msg.append("英作文は週3〜6本を目標に戻しましょう。")
 
     if recent["minutes"] < settings["weekday_minutes"] * 5:
-        msg.append("他科目が忙しい週は、単語10分＋リスニング5分だけでも継続すると流れが切れません。")
+        msg.append(
+            "他科目が忙しい週は、単語10分＋リスニング5分だけでも継続すると流れが切れません。"
+        )
     if recent["understanding"] and recent["understanding"] < 3:
-        msg.append("理解度が低めなので、新しい教材を増やすより復習比率を上げるのが有効です。")
+        msg.append(
+            "理解度が低めなので、新しい教材を増やすより復習比率を上げるのが有効です。"
+        )
 
-    return "\n\n".join(msg)
+    return "
+
+".join(msg)
 
 
 def simple_writing_feedback(text: str) -> Dict[str, List[str]]:
@@ -620,7 +801,8 @@ def simple_writing_feedback(text: str) -> Dict[str, List[str]]:
             "grammar": [],
         }
 
-    words = text.replace("\n", " ").split()
+    words = text.replace("
+", " ").split()
     word_count = len(words)
     strengths: List[str] = []
     suggestions: List[str] = []
@@ -629,10 +811,15 @@ def simple_writing_feedback(text: str) -> Dict[str, List[str]]:
     if word_count >= 80:
         strengths.append(f"語数は {word_count} 語で十分です。")
     else:
-        suggestions.append(f"語数が {word_count} 語です。まずは80語以上を目指しましょう。")
+        suggestions.append(
+            f"語数が {word_count} 語です。まずは80語以上を目指しましょう。"
+        )
 
     lowered = text.lower()
-    if any(x in lowered for x in ["first", "second", "for these reasons", "however", "therefore"]):
+    if any(
+        x in lowered
+        for x in ["first", "second", "for these reasons", "however", "therefore"]
+    ):
         strengths.append("構成の型を意識できています。")
     else:
         suggestions.append("First / Second / For these reasons を入れると安定します。")
@@ -672,7 +859,9 @@ def maybe_promote_stage(settings: Dict, result_status: str) -> Tuple[Dict, str]:
         settings["learning_stage"] = "英検準1級"
         settings["target_exam"] = "英検準1級"
         settings["current_level"] = "英検2級"
-        settings["selected_resources"] = DEFAULT_SELECTED_RESOURCES_BY_STAGE["英検準1級"].copy()
+        settings["selected_resources"] = DEFAULT_SELECTED_RESOURCES_BY_STAGE[
+            "英検準1級"
+        ].copy()
         return settings, "2級合格が入力されたので、教材を準1級モードに自動切替しました。"
     return settings, "現在の学習ステージを維持します。"
 
@@ -708,7 +897,9 @@ def apply_weakness_adjustment(settings: Dict, weak_areas: List[str]) -> None:
 
 
 def plan_recommendation_text(plan: Dict, settings: Dict) -> str:
-    target_exam_date = datetime.strptime(settings["target_exam_date"], "%Y-%m-%d").date()
+    target_exam_date = datetime.strptime(
+        settings["target_exam_date"], "%Y-%m-%d"
+    ).date()
     days_left = (target_exam_date - date.today()).days
     selected = settings.get(
         "selected_resources",
@@ -728,7 +919,8 @@ def plan_recommendation_text(plan: Dict, settings: Dict) -> str:
         f"リスニング: {plan['listening_minutes']}分",
         "使用教材: " + " / ".join([f"{k}={v}" for k, v in selected.items()]),
     ]
-    return "\n".join([f"- {x}" for x in items])
+    return "
+".join([f"- {x}" for x in items])
 
 
 def make_line_chart(df: pd.DataFrame, column: str, title: str) -> None:
@@ -756,7 +948,9 @@ def weekly_summary_table(df: pd.DataFrame) -> pd.DataFrame:
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
-st.caption("2級→準1級の自動切替、ゲーム要素、キャラクターコーチ、吹き出しUIに対応した家庭用英検学習ダッシュボード")
+st.caption(
+    "Google Sheets保存、2級→準1級の自動切替、ゲーム要素、キャラクターコーチ、吹き出しUIに対応した家庭用英検学習ダッシュボード"
+)
 
 ensure_data_files()
 settings = load_settings()
@@ -766,19 +960,29 @@ points = calc_total_points(df)
 rank_name, rank_floor, next_threshold = get_rank(points)
 streak = calc_streak(df)
 badges = collect_badges(df)
+mode_label = "Google Sheets" if _get_sheet_mode() == "sheets" else "ローカルCSV"
 
 with st.sidebar:
+    st.header("保存先")
+    st.caption(f"現在の保存先: {mode_label}")
+    if _get_sheet_mode() == "local":
+        st.info("st.secrets に Google Sheets の認証情報が入ると自動で Sheets 保存に切り替わります。")
+
     st.header("コーチ設定")
     coach_name = st.text_input("コーチの名前", value=settings.get("coach_name", "Mia"))
     coach_gender = st.selectbox(
         "コーチの性別",
         ["女性", "男性", "その他/未設定"],
-        index=["女性", "男性", "その他/未設定"].index(settings.get("coach_gender", "女性")),
+        index=["女性", "男性", "その他/未設定"].index(
+            settings.get("coach_gender", "女性")
+        ),
     )
     coach_personality = st.selectbox(
         "コーチの性格",
         list(COACH_PERSONALITIES.keys()),
-        index=list(COACH_PERSONALITIES.keys()).index(settings.get("coach_personality", "やさしい")),
+        index=list(COACH_PERSONALITIES.keys()).index(
+            settings.get("coach_personality", "やさしい")
+        ),
     )
     coach_image_url = st.text_input(
         "コーチ写真URL",
@@ -796,14 +1000,28 @@ with st.sidebar:
     current_level = st.selectbox(
         "現在の級",
         ["英検3級", "英検準2級", "英検2級"],
-        index=["英検3級", "英検準2級", "英検2級"].index(settings["current_level"]),
+        index=["英検3級", "英検準2級", "英検2級"].index(
+            settings["current_level"]
+        ),
     )
-    weekday_minutes = st.slider("平日の学習時間（分）", 30, 120, int(settings["weekday_minutes"]))
-    weekend_minutes = st.slider("週末の学習時間（分）", 45, 180, int(settings["weekend_minutes"]))
+    weekday_minutes = st.slider(
+        "平日の学習時間（分）", 30, 120, int(settings["weekday_minutes"])
+    )
+    weekend_minutes = st.slider(
+        "週末の学習時間（分）", 45, 180, int(settings["weekend_minutes"])
+    )
     busy_day = st.selectbox(
         "忙しい曜日",
         ["月曜日", "火曜日", "水曜日", "木曜日", "金曜日", "土曜日", "日曜日"],
-        index=["月曜日", "火曜日", "水曜日", "木曜日", "金曜日", "土曜日", "日曜日"].index(settings["busy_day"]),
+        index=[
+            "月曜日",
+            "火曜日",
+            "水曜日",
+            "木曜日",
+            "金曜日",
+            "土曜日",
+            "日曜日",
+        ].index(settings["busy_day"]),
     )
 
     st.header("教材選択")
@@ -848,6 +1066,7 @@ with st.sidebar:
         st.rerun()
 
 st.subheader(f"{settings['student_name']}さんの学習ダッシュボード")
+st.caption(f"保存先: {mode_label}")
 coach_col1, coach_col2 = st.columns([1, 4])
 with coach_col1:
     if settings.get("coach_image_url"):
@@ -888,12 +1107,49 @@ with st.expander("教材候補一覧", expanded=False):
     for category, options in RESOURCE_OPTIONS[stage_for_view].items():
         st.markdown(f"**{category}**")
         for item in options:
-            mark = "✅ " if settings.get(
-                "selected_resources",
-                DEFAULT_SELECTED_RESOURCES_BY_STAGE[stage_for_view],
-            ).get(category) == item else "- "
+            mark = (
+                "✅ "
+                if settings.get(
+                    "selected_resources",
+                    DEFAULT_SELECTED_RESOURCES_BY_STAGE[stage_for_view],
+                ).get(category)
+                == item
+                else "- "
+            )
             st.write(f"{mark}{item}")
             st.caption(RESOURCE_NOTES[category][item])
+
+with st.expander("Google Sheets 接続手順", expanded=False):
+    st.markdown(
+        """
+1. Google Cloud でサービスアカウントを作成し、JSONキーを取得します。  
+2. Google Sheets を作成し、サービスアカウントのメールアドレスを編集権限で共有します。  
+3. Streamlit Community Cloud の App settings → Secrets に次を登録します。  
+
+```toml
+[gcp_service_account]
+type = "service_account"
+project_id = "..."
+private_key_id = "..."
+private_key = "-----BEGIN PRIVATE KEY-----
+...
+-----END PRIVATE KEY-----
+"
+client_email = "...@...iam.gserviceaccount.com"
+client_id = "..."
+auth_uri = "https://accounts.google.com/o/oauth2/auth"
+token_uri = "https://oauth2.googleapis.com/token"
+auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+client_x509_cert_url = "..."
+universe_domain = "googleapis.com"
+
+[spreadsheet]
+name = "EikenCoachData"
+```
+
+4. 保存後にアプリを再起動すると、自動で Google Sheets 保存に切り替わります。
+        """
+    )
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(
     ["今日の計画", "ログ入力", "進捗", "英作文フィードバック", "試験結果"]
@@ -921,11 +1177,17 @@ with tab2:
     actual_vocab = c1.number_input("単語数", 0, 300, int(plan["vocab_words"]))
     actual_reading = c2.number_input("長文題数", 0, 10, int(plan["reading_sets"]))
     actual_writing = c3.number_input("英作文本数", 0, 10, int(plan["writing_sets"]))
-    actual_listening = c4.number_input("リスニング分", 0, 180, int(plan["listening_minutes"]))
+    actual_listening = c4.number_input(
+        "リスニング分", 0, 180, int(plan["listening_minutes"])
+    )
 
     c5, c6, c7, c8 = st.columns(4)
-    grammar_minutes = c5.number_input("文法分", 0, 180, int(plan["grammar_minutes"]))
-    total_minutes = c6.number_input("総学習時間（分）", 0, 300, int(plan["total_minutes"]))
+    grammar_minutes = c5.number_input(
+        "文法分", 0, 180, int(plan["grammar_minutes"])
+    )
+    total_minutes = c6.number_input(
+        "総学習時間（分）", 0, 300, int(plan["total_minutes"])
+    )
     understanding = c7.slider("理解度", 1, 5, 3)
     mood = c8.selectbox("気分", ["😊", "🙂", "😐", "😣", "😫"])
 
@@ -1008,10 +1270,16 @@ with tab4:
 
 with tab5:
     st.markdown("### 試験結果入力")
-    st.write("2級に合格したら、ここで結果を入力すると教材が準1級モードに自動で切り替わります。")
+    st.write(
+        "2級に合格したら、ここで結果を入力すると教材が準1級モードに自動で切り替わります。"
+    )
     exam_date_input = st.date_input("受験日", value=date.today(), key="exam_date_input")
-    result_status = st.selectbox("結果", ["未受験", "合格", "不合格"], key="result_status")
-    exam_score_input = st.text_input("スコア・メモ（任意）", value="", key="exam_score_input")
+    result_status = st.selectbox(
+        "結果", ["未受験", "合格", "不合格"], key="result_status"
+    )
+    exam_score_input = st.text_input(
+        "スコア・メモ（任意）", value="", key="exam_score_input"
+    )
     weak_area = st.multiselect(
         "不合格だった場合の弱点（任意）",
         ["文法", "語彙", "長文", "英作文", "リスニング"],
@@ -1033,4 +1301,6 @@ with tab5:
         st.rerun()
 
 st.divider()
-st.caption("使い方: ①コーチを設定 → ②2級モードで学習 → ③試験結果を入力 → ④合格なら準1級モードへ自動切替。吹き出しUIでコーチが毎日話しかけます。")
+st.caption(
+    "使い方: ①Google Sheets を設定すると公開版でもログが残る → ②コーチを設定 → ③2級モードで学習 → ④合格なら準1級モードへ自動切替。"
+)
