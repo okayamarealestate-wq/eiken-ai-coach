@@ -670,9 +670,7 @@ def praise_message(df: pd.DataFrame) -> str:
     if not messages:
         messages.append("今日も記録できたのが大きな前進です。継続できていて良い流れです。")
 
-    return "
-
-".join(messages)
+    return "\n\n".join(messages)
 
 
 def coach_comment(settings: Dict, plan: Dict, df: pd.DataFrame) -> str:
@@ -711,15 +709,7 @@ def coach_comment(settings: Dict, plan: Dict, df: pd.DataFrame) -> str:
     )
 
     return (
-        f"{opener} {style}
-
-{mission}
-
-{stage_line}
-
-{streak_line}
-
-{praise}"
+        f"{opener} {style}\n\n{mission}\n\n{stage_line}\n\n{streak_line}\n\n{praise}"
     )
 
 
@@ -740,8 +730,7 @@ def coach_bubble_html(settings: Dict, message: str) -> str:
         "フレンドリー": "#34D399",
         "お姉さん/お兄さん風": "#F59E0B",
     }.get(personality, "#C084FC")
-    escaped = message.replace("
-", "<br>")
+    escaped = message.replace("\n", "<br>")
 
     return f"""
     <div style='display:flex; align-items:flex-start; gap:12px; margin:8px 0 18px 0;'>
@@ -786,9 +775,7 @@ def generate_feedback(df: pd.DataFrame, settings: Dict) -> str:
             "理解度が低めなので、新しい教材を増やすより復習比率を上げるのが有効です。"
         )
 
-    return "
-
-".join(msg)
+    return "\n\n".join(msg)
 
 
 def simple_writing_feedback(text: str) -> Dict[str, List[str]]:
@@ -801,8 +788,7 @@ def simple_writing_feedback(text: str) -> Dict[str, List[str]]:
             "grammar": [],
         }
 
-    words = text.replace("
-", " ").split()
+    words = text.replace("\n", " ").split()
     word_count = len(words)
     strengths: List[str] = []
     suggestions: List[str] = []
@@ -919,8 +905,7 @@ def plan_recommendation_text(plan: Dict, settings: Dict) -> str:
         f"リスニング: {plan['listening_minutes']}分",
         "使用教材: " + " / ".join([f"{k}={v}" for k, v in selected.items()]),
     ]
-    return "
-".join([f"- {x}" for x in items])
+    return "\n".join([f"- {x}" for x in items])
 
 
 def make_line_chart(df: pd.DataFrame, column: str, title: str) -> None:
@@ -1067,6 +1052,7 @@ with st.sidebar:
 
 st.subheader(f"{settings['student_name']}さんの学習ダッシュボード")
 st.caption(f"保存先: {mode_label}")
+
 coach_col1, coach_col2 = st.columns([1, 4])
 with coach_col1:
     if settings.get("coach_image_url"):
@@ -1131,10 +1117,7 @@ with st.expander("Google Sheets 接続手順", expanded=False):
 type = "service_account"
 project_id = "..."
 private_key_id = "..."
-private_key = "-----BEGIN PRIVATE KEY-----
-...
------END PRIVATE KEY-----
-"
+private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
 client_email = "...@...iam.gserviceaccount.com"
 client_id = "..."
 auth_uri = "https://accounts.google.com/o/oauth2/auth"
@@ -1145,162 +1128,3 @@ universe_domain = "googleapis.com"
 
 [spreadsheet]
 name = "EikenCoachData"
-```
-
-4. 保存後にアプリを再起動すると、自動で Google Sheets 保存に切り替わります。
-        """
-    )
-
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["今日の計画", "ログ入力", "進捗", "英作文フィードバック", "試験結果"]
-)
-
-with tab1:
-    st.markdown("### 今日やること")
-    st.write(f"- 単語: {plan['vocab_words']}語")
-    st.write(f"- 文法: {plan['grammar_minutes']}分")
-    st.write(f"- 長文: {plan['reading_sets']}題")
-    st.write(f"- 英作文: {plan['writing_sets']}題")
-    st.write(f"- リスニング: {plan['listening_minutes']}分")
-    st.markdown("### 今日の英作文テーマ")
-    st.write(WRITING_TOPICS[date.today().toordinal() % len(WRITING_TOPICS)])
-    st.markdown("### コーチからのひとこと")
-    st.markdown(
-        coach_bubble_html(settings, generate_feedback(df, settings)),
-        unsafe_allow_html=True,
-    )
-
-with tab2:
-    st.markdown("### 実施ログ入力")
-    log_date = st.date_input("日付", value=date.today())
-    c1, c2, c3, c4 = st.columns(4)
-    actual_vocab = c1.number_input("単語数", 0, 300, int(plan["vocab_words"]))
-    actual_reading = c2.number_input("長文題数", 0, 10, int(plan["reading_sets"]))
-    actual_writing = c3.number_input("英作文本数", 0, 10, int(plan["writing_sets"]))
-    actual_listening = c4.number_input(
-        "リスニング分", 0, 180, int(plan["listening_minutes"])
-    )
-
-    c5, c6, c7, c8 = st.columns(4)
-    grammar_minutes = c5.number_input(
-        "文法分", 0, 180, int(plan["grammar_minutes"])
-    )
-    total_minutes = c6.number_input(
-        "総学習時間（分）", 0, 300, int(plan["total_minutes"])
-    )
-    understanding = c7.slider("理解度", 1, 5, 3)
-    mood = c8.selectbox("気分", ["😊", "🙂", "😐", "😣", "😫"])
-
-    school_busy = st.selectbox("学校の忙しさ", ["低い", "普通", "高い"], index=1)
-    writing_text = st.text_area("今日の英作文（任意）", height=160)
-    reflection = st.text_area("振り返りメモ", height=100)
-
-    if st.button("ログを保存", type="primary", use_container_width=True):
-        save_log_row(
-            {
-                "date": pd.Timestamp(log_date),
-                "planned_vocab": plan["vocab_words"],
-                "planned_reading": plan["reading_sets"],
-                "planned_writing": plan["writing_sets"],
-                "planned_listening": plan["listening_minutes"],
-                "actual_vocab": actual_vocab,
-                "actual_reading": actual_reading,
-                "actual_writing": actual_writing,
-                "actual_listening": actual_listening,
-                "grammar_minutes": grammar_minutes,
-                "total_minutes": total_minutes,
-                "understanding": understanding,
-                "mood": mood,
-                "school_busy": school_busy,
-                "writing_text": writing_text,
-                "reflection": reflection,
-            }
-        )
-        st.success("ログを保存しました。ポイントと連続日数が更新されます。")
-        st.rerun()
-
-with tab3:
-    st.markdown("### 進捗ダッシュボード")
-    if df.empty:
-        st.write("まだログがありません。")
-    else:
-        recent7 = summarize_progress(df, 7)
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("7日間の総学習時間", f"{int(recent7['minutes'])}分")
-        m2.metric("7日間の単語", f"{int(recent7['vocab'])}語")
-        m3.metric("7日間の長文", f"{int(recent7['reading'])}題")
-        m4.metric("7日間の英作文", f"{int(recent7['writing'])}本")
-
-        st.markdown("### AIコーチのフィードバック")
-        st.markdown(
-            coach_bubble_html(settings, generate_feedback(df, settings)),
-            unsafe_allow_html=True,
-        )
-
-        display_df = df.sort_values("date", ascending=False).copy()
-        display_df["date"] = display_df["date"].dt.strftime("%Y-%m-%d")
-        st.dataframe(display_df, use_container_width=True)
-
-        chart_df = df.sort_values("date")
-        make_line_chart(chart_df, "actual_vocab", "単語数の推移")
-        make_line_chart(chart_df, "total_minutes", "学習時間の推移")
-        make_line_chart(chart_df, "understanding", "理解度の推移")
-
-        st.markdown("### 週次まとめ")
-        st.dataframe(weekly_summary_table(df), use_container_width=True)
-
-with tab4:
-    st.markdown("### 英作文フィードバック")
-    essay = st.text_area("英文を入力してください", height=220)
-    if st.button("フィードバックを実行", use_container_width=True):
-        result = simple_writing_feedback(essay)
-        st.metric("簡易スコア", result["score"][0])
-
-        st.markdown("**良い点**")
-        for x in result["strengths"]:
-            st.write(f"- {x}")
-
-        st.markdown("**改善点**")
-        for x in result["suggestions"]:
-            st.write(f"- {x}")
-
-        st.markdown("**文法・表現チェック**")
-        for x in result["grammar"]:
-            st.write(f"- {x}")
-
-with tab5:
-    st.markdown("### 試験結果入力")
-    st.write(
-        "2級に合格したら、ここで結果を入力すると教材が準1級モードに自動で切り替わります。"
-    )
-    exam_date_input = st.date_input("受験日", value=date.today(), key="exam_date_input")
-    result_status = st.selectbox(
-        "結果", ["未受験", "合格", "不合格"], key="result_status"
-    )
-    exam_score_input = st.text_input(
-        "スコア・メモ（任意）", value="", key="exam_score_input"
-    )
-    weak_area = st.multiselect(
-        "不合格だった場合の弱点（任意）",
-        ["文法", "語彙", "長文", "英作文", "リスニング"],
-        key="weak_area",
-    )
-
-    if st.button("試験結果を保存して教材を更新", type="primary", use_container_width=True):
-        settings["last_exam_result"] = result_status
-        settings["last_exam_score"] = exam_score_input
-        settings["last_exam_date"] = exam_date_input.strftime("%Y-%m-%d")
-        settings, message = maybe_promote_stage(settings, result_status)
-
-        if result_status == "不合格" and weak_area:
-            apply_weakness_adjustment(settings, weak_area)
-            message += " 不合格時の弱点に合わせて教材も調整しました。"
-
-        save_settings(settings)
-        st.success(message)
-        st.rerun()
-
-st.divider()
-st.caption(
-    "使い方: ①Google Sheets を設定すると公開版でもログが残る → ②コーチを設定 → ③2級モードで学習 → ④合格なら準1級モードへ自動切替。"
-)
